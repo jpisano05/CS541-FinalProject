@@ -27,7 +27,8 @@ sampleRate = 5
 resizeResolution = 112
 
 #loads in all the data from a /data file and converts it to numpy
-def setupData():
+#startFrom lets you start from a specific speaker so not every file needs to be constantly remade
+def setupData(startFrom = 0):
     #all the paths
 
     videoPath = Path('data/3625687')
@@ -35,7 +36,11 @@ def setupData():
 
     numSpeakers = 34
 
-    for n in range(numSpeakers):
+    for n in range(startFrom - 1, numSpeakers):
+        #speaker 21 just doesn't exist? so skip it
+        if n == 20:
+            continue
+        
         print("beginning speaker:", n + 1)
 
         audioSet = []
@@ -104,10 +109,16 @@ def setupData():
         torch.save(audioTensor, Path('data') / Path(speakerId + "audio.pt"))
         torch.save(videoTensor, Path('data') / Path(speakerId + "video.pt"))
         torch.save(speakerTensor, Path('data') / Path(speakerId + "labels.pt"))
-            
-            
+
+#load the data from a particular speaker
+def loadSpeaker(speakerNum):
+    audioTensor = torch.load(Path('data') / Path("s" + speakerNum + "audio.pt"))
+    videoTensor = torch.load(Path('data') / Path("s" + speakerNum + "video.pt"))
+    speakerTensor = torch.load(Path('data') / Path("s" + speakerNum + "labels.pt"))
+    
+    return audioTensor, videoTensor, speakerTensor
 
 
 if __name__ == "__main__":
-    setupData()
+    setupData(22)
     pass
