@@ -2,3 +2,7 @@
 .venv
 /data
 /old
+gridcorpus/audio/
+gridcorpus/video/
+gridcorpus/alignments/
+gridcorpus/*.zip
