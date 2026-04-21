@@ -16,6 +16,7 @@ import os
 import time
 import cv2
 from pathlib import Path
+import librosa
 
 #data path
 dataPath = '/data'
@@ -25,6 +26,29 @@ dataPath = '/data'
 sampleRate = 5
 #resolution to resize video frames to
 resizeResolution = 112
+
+def makeSpectrogram(audioTensor, sr=25000, targetSr=16000):
+    """Convert raw audio tensor to mel-spectrogram"""
+    audio = audioTensor.numpy().squeeze()
+    
+    # Resample to 16kHz
+    if sr != targetSr:
+        audio = librosa.resample(audio, orig_sr=sr, target_sr=targetSr)
+    
+    # Take first 3 seconds, pad if shorter
+    maxLen = targetSr * 3
+    if len(audio) > maxLen:
+        audio = audio[:maxLen]
+    else:
+        audio = np.pad(audio, (0, maxLen - len(audio)))
+    
+    # Make mel-spectrogram
+    mel = librosa.feature.melspectrogram(
+        y=audio, sr=targetSr, n_mels=128, fmax=8000
+    )
+    mel_db = librosa.power_to_db(mel, ref=np.max)
+    
+    return torch.tensor(mel_db, dtype=torch.float32)
 
 #loads in all the data from a /data file and converts it to numpy
 #startFrom lets you start from a specific speaker so not every file needs to be constantly remade
