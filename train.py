@@ -110,6 +110,13 @@ def setupData(startFrom = 0):
         torch.save(videoTensor, Path('data') / Path(speakerId + "video.pt"))
         torch.save(speakerTensor, Path('data') / Path(speakerId + "labels.pt"))
 
+        # save spectrograms
+        specList = []
+        for a in audioSet:
+            spec = makeSpectrogram(torch.tensor(a))
+            specList.append(spec)
+        torch.save(specList, Path('data') / Path(speakerId + "spectrograms.pt"))
+
 #load the data from a particular speaker
 def loadSpeaker(speakerNum):
     audioTensor = torch.load(Path('data') / Path("s" + speakerNum + "audio.pt"))
