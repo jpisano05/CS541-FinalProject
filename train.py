@@ -50,6 +50,45 @@ def makeSpectrogram(audioTensor, sr=25000, targetSr=16000):
     
     return torch.tensor(mel_db, dtype=torch.float32)
 
+_faceCascade = None
+
+#function to extract the most prominent face from a video frame, crop it, and resize it to a target size (default 112x112)
+def extractStillFace(frame, targetSize=112):
+    global _faceCascade
+
+    if frame is None or frame.size == 0:
+        raise ValueError("Frame is empty; cannot extract face.")
+
+    if _faceCascade is None:
+        cascadePath = os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml")
+        _faceCascade = cv2.CascadeClassifier(cascadePath)
+        if _faceCascade.empty():
+            raise RuntimeError(f"Failed to load Haar cascade at: {cascadePath}")
+
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
+    faces = _faceCascade.detectMultiScale(
+        gray,
+        scaleFactor=1.1,
+        minNeighbors=5,
+        minSize=(30, 30)
+    )
+
+    if len(faces) > 0:
+        x, y, w, h = max(faces, key=lambda faceBox: faceBox[2] * faceBox[3])
+        face = frame[y:y+h, x:x+w]
+    else:
+        h, w = frame.shape[:2]
+        minDim = min(h, w)
+        startX = (w - minDim) // 2
+        startY = (h - minDim) // 2
+        face = frame[startY:startY+minDim, startX:startX+minDim]
+
+    faceResized = cv2.resize(face, (targetSize, targetSize), interpolation=cv2.INTER_AREA)
+    if faceResized.ndim == 2:
+        faceResized = cv2.cvtColor(faceResized, cv2.COLOR_GRAY2BGR)
+
+    return torch.tensor(faceResized, dtype=torch.float32).permute(2, 0, 1) / 255.0
+
 #loads in all the data from a /data file and converts it to numpy
 #startFrom lets you start from a specific speaker so not every file needs to be constantly remade
 def setupData(startFrom = 0):
