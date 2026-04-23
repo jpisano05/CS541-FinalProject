@@ -4,11 +4,12 @@ import scipy.optimize
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import TensorDataset, DataLoader, Dataset
+from torch.utils.data import TensorDataset, DataLoader, Dataset, random_split
 from torchvision import datasets, models
 from torchvision.transforms import ToTensor
 import torchvision.transforms as transforms
 from torch.optim import lr_scheduler
+import torch.optim as optim
 import torch.backends.cudnn as cudnn
 import torchaudio
 from tempfile import TemporaryDirectory
@@ -29,6 +30,12 @@ resizeResolution = 112
 
 #hyperparameters
 batchSize = 32
+specLearningRate = 0.1
+specMomentum = 0.9
+specWeightDecay = 5e-4
+specStepSize = 30
+specGamma = 0.1
+specEpochs = 10
 
 #define dataset classes
 class AVDataset(Dataset):
@@ -46,6 +53,81 @@ class AVDataset(Dataset):
         
         #don't load the raw audio since it's unneeded with the spectrogram
         return data["spec"], data["video"], data["label"]
+
+#define model classes
+
+#Residual block to avoid vanishing gradient, to be used with the Resnet 18
+class ResBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, stride = 1):
+        super(ResBlock, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size = 3, stride = stride, padding = 1, bias = False)
+        self.bn1 = nn.batchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace = True)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size = 3, stride = 1, padding = 1, bias = False)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size = 1, stride = stride, bias = False),
+                nn.BatchNorm2d(out_channels)
+            )
+    
+    def forward(self, x):
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        out = self.conv2(out)
+        out = self.bn2(out)
+        out += self.shortcut(x)
+        out = self.relu(out)
+        return out
+
+#ResNet18 for handling the spectrogram
+class ResNet18(nn.Module):
+    def __init__(self):
+        super(ResNet18, self).__init__()
+        
+        #in channels should equal the shape[0] of the spectrogram
+        #128 in this case
+        self.in_channels = 128
+        self.conv1 = nn.Conv2d(3, 128, kernel_size = 3, stride = 1, padding = 1, bias = False)
+        self.bn1 = nn.BatchNorm2d(64)
+        self.relu = nn.ReLU(inplace = True)
+        
+        self.layer1 = self._make_layer(ResBlock, 128, 2, stride = 1)
+        self.layer2 = self._make_layer(ResBlock, 256, 2, stride = 2)
+        self.layer3 = self._make_layer(ResBlock, 512, 2, stride = 2)
+        self.layer4 = self._make_layer(ResBlock, 1024, 2, stride = 2)
+        
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        
+        #output a 256 size vector
+        self.fc = nn.Linear(1024, 256)
+    
+    def _make_layer(self, block, out_channels, num_blocks, stride):
+        strides = [stride] + [1]*(num_blocks-1)
+        layers = []
+        for stride in strides:
+            layers.append(block(self.in_channels, out_channels, stride))
+            self.in_channels = out_channels
+        return nn.Sequential(*layers)
+    
+    def forward(self, x):
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        
+        out = self.layer1(out)
+        out = self.layer2(out)
+        out = self.layer3(out)
+        out = self.layer4(out)
+        
+        out = self.avgpool(out)
+        out = out.view(out.size(0), -1)
+        out = self.fc(out)
+        return out
+        
 
 def makeSpectrogram(audioTensor, sr=25000, targetSr=16000):
     """Convert raw audio tensor to mel-spectrogram"""
@@ -234,15 +316,58 @@ def collate_fn(batch):
         torch.tensor(labels)
     )
 
+#training loop
+def train(model, device, trainLoader, testLoader, epochs):
+    size = len(trainLoader.dataset)
+    
+    #train mode for batch norm
+    model.train()
+    
+    #for batch, (X, y) in enumerate(trainLoader):
+    #    X, y = X.to(device), y.to(device)
+    #    pred = model(X)
+    #    loss = lossFunc(pred, y)
+    #    
+    #    #backwards
+    #    loss.backward()
+    #    optimizer.step()
+    #    optimizer.zero_grad()
+    #    
+    #    if batch % 100 == 0:
+    #        #print loss at current step for debug purposes
+    #        loss, current = loss.item(), batch * batchSize + len(X)
+    #        print(f"loss: {loss:>7f}  [{current:>5d}/{size:>5d}]")
+
 if __name__ == "__main__":
     #setup data only needs to be ran if the .pt files have not already been created
-    setupData()
+    #setupData()
     
     #setup dataloaders
     data = AVDataset("processed_data")
-    loader = DataLoader(data, batch_size=batchSize, shuffle=True, num_workers=2, collate_fn=collate_fn, pin_memory=True)
+    
+    #80/20 split
+    trainSplit = int(0.8 * len(data))
+    testSplit = len(data) - trainSplit
+    
+    trainData, testData = random_split(data, [trainSplit, testSplit])
+    
+    trainLoader = DataLoader(trainData, batch_size=batchSize, shuffle=True, num_workers=2, collate_fn=collate_fn, pin_memory=True)
+    testLoader = DataLoader(testData, batch_size=batchSize, shuffle=False, num_workers=2, collate_fn=collate_fn, pin_memory=True)
+    
+    
+    spec, vid, label = trainData[0]
+    print(spec.shape)
+    print(vid.shape)
     
     #setup model
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    #define the spectrogram model
+    specModel = ResNet18().to(device)
+    
+    #Setup criterion for the ResNet18
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.SGD(specModel.parameters(), lr = specLearningRate, momentum = specMomentum, weight_decay = specWeightDecay)
+    scheduler = optim.lr_scheduler(optimizer, step_size = specStepSize, gamma = specGamma)
     
     pass
