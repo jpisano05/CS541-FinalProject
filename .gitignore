@@ -6,3 +6,4 @@ gridcorpus/audio/
 gridcorpus/video/
 gridcorpus/alignments/
 gridcorpus/*.zip
+/processed_data
