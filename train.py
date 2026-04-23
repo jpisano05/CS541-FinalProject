@@ -27,8 +27,28 @@ sampleRate = 5
 #resolution to resize video frames to
 resizeResolution = 112
 
-#Convert raw audio tensor to mel-spectrogram
+#hyperparameters
+batchSize = 32
+
+#define dataset classes
+class AVDataset(Dataset):
+    #initialize
+    def __init__(self, folder):
+        self.files = list(Path(folder).glob("*.pt"))
+    
+    #get length
+    def __len__(self):
+        return len(self.files)
+
+    #load file
+    def __getitem__(self, idx):
+        data = torch.load(self.files[idx])
+        
+        #don't load the raw audio since it's unneeded with the spectrogram
+        return data["spec"], data["video"], data["label"]
+
 def makeSpectrogram(audioTensor, sr=25000, targetSr=16000):
+    """Convert raw audio tensor to mel-spectrogram"""
     audio = audioTensor.numpy().squeeze()
     
     # Resample to 16kHz
@@ -52,7 +72,7 @@ def makeSpectrogram(audioTensor, sr=25000, targetSr=16000):
 
 _faceCascade = None
 
-#Detect, crop, and resize the most prominent face from a video frame.
+#function to extract the most prominent face from a video frame, crop it, and resize it to a target size (default 112x112)
 def extractStillFace(frame, targetSize=112):
     global _faceCascade
 
@@ -91,13 +111,17 @@ def extractStillFace(frame, targetSize=112):
 
 #loads in all the data from a /data file and converts it to numpy
 #startFrom lets you start from a specific speaker so not every file needs to be constantly remade
-def setupData(startFrom = 0):
+def setupData(startFrom = 1):
     #all the paths
 
     videoPath = Path('data/3625687')
     audioPath = Path('data/3625687/audio_25k/audio_25k')
+    
+    savePath = Path('processed_data')
+    savePath.mkdir(exist_ok=True)
 
     numSpeakers = 34
+    sampleId = 0
 
     for n in range(startFrom - 1, numSpeakers):
         #speaker 21 just doesn't exist? so skip it
@@ -105,10 +129,6 @@ def setupData(startFrom = 0):
             continue
         
         print("beginning speaker:", n + 1)
-
-        audioSet = []
-        videoSet = []
-        speakerSet = []
 
         speakerId = f"s{n+1}"
 
@@ -142,9 +162,10 @@ def setupData(startFrom = 0):
             cap.release()
             
             #stack all the frames into one numpy array then add them to the set
-            if frames:
-                arr = np.stack(frames)
-                videoSet.append(arr)
+            if not frames:
+                continue
+            
+            videoArr = np.stack(frames)
             
             #then get the matching audio
             try:
@@ -152,34 +173,32 @@ def setupData(startFrom = 0):
                 print("Trying:", aPath, os.path.exists(aPath))
                 
                 waveform, sr = torchaudio.load(aPath)
-                arr = waveform.numpy()
-                audioSet.append(arr)
+                audioArr = waveform.numpy()
             #if no matching audio then toss out the video since they need to be corresponding for this to work
             except Exception as e:
                 print("No matching audio")
                 print(e)
-                videoSet.pop()
                 continue
             
-            #then append the speaker number to speaker set as a label
-            speakerSet.append(n+1)
-    
-        #tensor the 3 sets
-        audioTensor = [torch.tensor(a) for a in audioSet]
-        videoTensor = [torch.tensor(v) for v in videoSet]
-        speakerTensor = torch.tensor(speakerSet)
-        
-        #save to files for later
-        torch.save(audioTensor, Path('data') / Path(speakerId + "audio.pt"))
-        torch.save(videoTensor, Path('data') / Path(speakerId + "video.pt"))
-        torch.save(speakerTensor, Path('data') / Path(speakerId + "labels.pt"))
+            #tensor the 3 forms of data
+            audioTensor = torch.tensor(audioArr)
+            videoTensor = torch.tensor(videoArr)
+            label = n+1
+            
+            #make a spectrogram from the audio
+            spec = makeSpectrogram(audioTensor)
+            
+            #store the matching pieces together
+            sample = {
+                "audio": audioTensor,
+                "video": videoTensor,
+                "label": label,
+                "spec": spec
+            }
 
-        # save spectrograms
-        specList = []
-        for a in audioSet:
-            spec = makeSpectrogram(torch.tensor(a))
-            specList.append(spec)
-        torch.save(specList, Path('data') / Path(speakerId + "spectrograms.pt"))
+            #save to files for later
+            torch.save(sample, savePath / Path("sample" + str(sampleId) + ".pt"))
+            sampleId += 1
 
 #load the data from a particular speaker
 def loadSpeaker(speakerNum):
@@ -189,7 +208,42 @@ def loadSpeaker(speakerNum):
     
     return audioTensor, videoTensor, speakerTensor
 
+#collate function to properly pad the video
+#spectrograms are already padded
+#drops the audio for now since i dont think we need it, just the spectrogram
+def collate_fn(batch):
+    specs, videos, labels = zip(*batch)
+    
+    #video padding
+    #get the largest video
+    mostFrames = max(v.shape[0] for v in videos)
+    
+    paddedVideos = []
+    #for each video in the batch
+    for v in videos:
+        extraFrames = mostFrames - v.shape[0]
+        
+        #add extra empty frames to match length of the longest
+        padTensor = torch.zeros((extraFrames, *v.shape[1:]), dtype=v.dtype)
+        v = torch.cat([v, padTensor], dim = 0)
+        
+        paddedVideos.append(v)
+    
+    return (
+        torch.stack(specs),
+        torch.stack(paddedVideos),
+        torch.tensor(labels)
+    )
 
 if __name__ == "__main__":
-    setupData(22)
+    #setup data only needs to be ran if the .pt files have not already been created
+    setupData()
+    
+    #setup dataloaders
+    data = AVDataset("processed_data")
+    loader = DataLoader(data, batch_size=batchSize, shuffle=True, num_workers=2, collate_fn=collate_fn, pin_memory=True)
+    
+    #setup model
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    
     pass
