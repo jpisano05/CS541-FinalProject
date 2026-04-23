@@ -10,7 +10,6 @@ from torchvision.transforms import ToTensor
 import torchvision.transforms as transforms
 from torch.optim import lr_scheduler
 import torch.backends.cudnn as cudnn
-import torchaudio
 from tempfile import TemporaryDirectory
 import os
 import time
@@ -49,6 +48,13 @@ def makeSpectrogram(audioTensor, sr=25000, targetSr=16000):
     mel_db = librosa.power_to_db(mel, ref=np.max)
     
     return torch.tensor(mel_db, dtype=torch.float32)
+
+def loadAudioArray(audioPath):
+    """Load WAV audio without TorchCodec; returns (channels, samples) float32 array and sample rate."""
+    audio, sr = librosa.load(audioPath, sr=None, mono=False)
+    if audio.ndim == 1:
+        audio = np.expand_dims(audio, axis=0)
+    return audio.astype(np.float32), sr
 
 _faceCascade = None
 
@@ -89,13 +95,22 @@ def extractStillFace(frame, targetSize=112):
 
     return torch.tensor(faceResized, dtype=torch.float32).permute(2, 0, 1) / 255.0
 
-#loads in all the data from a /data file and converts it to numpy
+#loads in all the data and converts it to numpy
 #startFrom lets you start from a specific speaker so not every file needs to be constantly remade
 def setupData(startFrom = 0):
-    #all the paths
+    # Prefer local gridcorpus layout, then fall back to legacy path layout.
+    videoPath = Path('gridcorpus/video') if Path('gridcorpus/video').exists() else Path('data/3625687')
+    audioPath = Path('gridcorpus/audio_25k') if Path('gridcorpus/audio_25k').exists() else Path('data/3625687/audio_25k/audio_25k')
+    outputPath = Path('data')
+    outputPath.mkdir(parents=True, exist_ok=True)
 
-    videoPath = Path('data/3625687')
-    audioPath = Path('data/3625687/audio_25k/audio_25k')
+    if not videoPath.exists():
+        raise FileNotFoundError(f"Video dataset path not found: {videoPath}")
+    if not audioPath.exists():
+        raise FileNotFoundError(
+            f"Audio dataset path not found: {audioPath}. "
+            "Extract gridcorpus/audio_25k.zip so files exist under gridcorpus/audio_25k/s*/."
+        )
 
     numSpeakers = 34
 
@@ -112,15 +127,24 @@ def setupData(startFrom = 0):
 
         speakerId = f"s{n+1}"
 
-        speakerVideoPath = videoPath / speakerId / speakerId
+        speakerVideoPath = videoPath / speakerId
+        if not speakerVideoPath.exists():
+            speakerVideoPath = videoPath / speakerId / speakerId
         speakerAudioPath = audioPath / speakerId
+
+        if not speakerVideoPath.exists():
+            print(f"Skipping {speakerId}: missing video path {speakerVideoPath}")
+            continue
+        if not speakerAudioPath.exists():
+            print(f"Skipping {speakerId}: missing audio path {speakerAudioPath}")
+            continue
+
         videos = os.listdir(speakerVideoPath)
-        audios = os.listdir(speakerAudioPath)
         
         #for each video
         for v in videos:
             #make sure the video is actually a video
-            if not v.lower().endswith(".mpg"):
+            if not v.lower().endswith(".mpg") or v.startswith("._"):
                 continue
             
             vPath = os.path.join(speakerVideoPath, v)
@@ -134,24 +158,28 @@ def setupData(startFrom = 0):
                 if not ret:
                     break
                 if frameCounter % sampleRate == 0:
-                    frame = cv2.resize(frame, (resizeResolution, resizeResolution))
+                    face = extractStillFace(frame, targetSize=resizeResolution)
+                    frame = (face.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
                     frames.append(frame)
                 frameCounter += 1
             
             cap.release()
             
             #stack all the frames into one numpy array then add them to the set
-            if frames:
-                arr = np.stack(frames)
-                videoSet.append(arr)
+            if not frames:
+                continue
+
+            arr = np.stack(frames)
+            videoSet.append(arr)
             
             #then get the matching audio
             try:
                 aPath = os.path.join(speakerAudioPath, v[:-3] + "wav")
                 print("Trying:", aPath, os.path.exists(aPath))
-                
-                waveform, sr = torchaudio.load(aPath)
-                arr = waveform.numpy()
+                if not os.path.exists(aPath):
+                    raise FileNotFoundError(aPath)
+
+                arr, sr = loadAudioArray(aPath)
                 audioSet.append(arr)
             #if no matching audio then toss out the video since they need to be corresponding for this to work
             except Exception as e:
@@ -169,16 +197,16 @@ def setupData(startFrom = 0):
         speakerTensor = torch.tensor(speakerSet)
         
         #save to files for later
-        torch.save(audioTensor, Path('data') / Path(speakerId + "audio.pt"))
-        torch.save(videoTensor, Path('data') / Path(speakerId + "video.pt"))
-        torch.save(speakerTensor, Path('data') / Path(speakerId + "labels.pt"))
+        torch.save(audioTensor, outputPath / Path(speakerId + "audio.pt"))
+        torch.save(videoTensor, outputPath / Path(speakerId + "video.pt"))
+        torch.save(speakerTensor, outputPath / Path(speakerId + "labels.pt"))
 
         # save spectrograms
         specList = []
         for a in audioSet:
             spec = makeSpectrogram(torch.tensor(a))
             specList.append(spec)
-        torch.save(specList, Path('data') / Path(speakerId + "spectrograms.pt"))
+        torch.save(specList, outputPath / Path(speakerId + "spectrograms.pt"))
 
 #load the data from a particular speaker
 def loadSpeaker(speakerNum):
