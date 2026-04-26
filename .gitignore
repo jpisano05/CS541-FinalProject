@@ -7,3 +7,4 @@ gridcorpus/video/
 gridcorpus/alignments/
 gridcorpus/*.zip
 /processed_data
+/trainedWeights
