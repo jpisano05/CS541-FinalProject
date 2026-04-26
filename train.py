@@ -445,7 +445,115 @@ def train(specModel, faceModel, trainLoader, testLoader, optimizer, device):
         #print the average loss over training and test set to get an idea of progress
         testLoss /= batches
         print(f"Epoch {epoch} | Train Loss: {trainLoss} | Test Loss: {testLoss}")
-            
+
+#Evaluate the trained model - verification and retrieval accuracy          
+def evaluate(specModel, faceModel, testLoader, device):
+ 
+    mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+
+    specModel.eval()
+    faceModel.eval()
+
+    allSpecEmbeds = []
+    allFaceEmbeds = []
+    allLabels = []
+
+    with torch.inference_mode():
+        for specs, videos, labels in testLoader:
+            specs = specs.to(device)
+            faces = videos[:, 0].to(device)
+            faces = faces.permute(0, 3, 1, 2)
+            faces = F.interpolate(faces, size=(224, 224))
+            faces = (faces - mean) / std
+
+            specEmbed = F.normalize(specModel(specs), dim=1)
+            faceEmbed = F.normalize(faceModel(faces), dim=1)
+
+            allSpecEmbeds.append(specEmbed.cpu())
+            allFaceEmbeds.append(faceEmbed.cpu())
+            allLabels.append(labels)
+
+    allSpecEmbeds = torch.cat(allSpecEmbeds)
+    allFaceEmbeds = torch.cat(allFaceEmbeds)
+    allLabels = torch.cat(allLabels)
+
+    total = len(allLabels)
+    uniqueSpeakers = allLabels.unique()
+    print(f"\n{'='*50}")
+    print("EVALUATION RESULTS")
+    print(f"{'='*50}")
+    print(f"Total test samples: {total}")
+    print(f"Unique speakers: {len(uniqueSpeakers)}")
+
+    similarity = allFaceEmbeds @ allSpecEmbeds.T
+    predictions = similarity.argmax(dim=1)
+
+    correct = 0
+    for i in range(total):
+        if allLabels[i] == allLabels[predictions[i]]:
+            correct += 1
+
+    verifyAcc = correct / total * 100
+    randomBaseline = 1 / len(uniqueSpeakers) * 100
+
+    print("\n--- Verification ---")
+    print(f"Accuracy: {verifyAcc:.2f}%")
+    print(f"Random guess baseline: {randomBaseline:.2f}%")
+
+    print("\n--- Face-to-Voice Retrieval ---")
+    for gallerySize in [10, 50, 100]:
+        if gallerySize > total:
+            continue
+
+        top1Correct = 0
+        top5Correct = 0
+        trials = min(200, total)
+        validTrials = 0
+
+        for _ in range(trials):
+            queryIdx = torch.randint(0, total, (1,)).item()
+            queryFace = allFaceEmbeds[queryIdx]
+            queryLabel = allLabels[queryIdx]
+
+            matchingIdxs = (allLabels == queryLabel).nonzero().squeeze()
+            if matchingIdxs.dim() == 0:
+                continue
+
+            matchIdx = matchingIdxs[torch.randint(0, len(matchingIdxs), (1,))].item()
+
+            nonMatchIdxs = (allLabels != queryLabel).nonzero().squeeze()
+            if len(nonMatchIdxs) < gallerySize - 1:
+                continue
+
+            randIdxs = nonMatchIdxs[torch.randperm(len(nonMatchIdxs))[:gallerySize - 1]]
+            galleryIdxs = torch.cat([torch.tensor([matchIdx]), randIdxs])
+
+            gallerySpecs = allSpecEmbeds[galleryIdxs]
+            galleryLabels = allLabels[galleryIdxs]
+            sims = F.cosine_similarity(queryFace.unsqueeze(0), gallerySpecs)
+            ranked = sims.argsort(descending=True)
+
+            if galleryLabels[ranked[0]] == queryLabel:
+                top1Correct += 1
+
+            topk = min(5, gallerySize)
+            if queryLabel in galleryLabels[ranked[:topk]]:
+                top5Correct += 1
+
+            validTrials += 1
+
+        if validTrials == 0:
+            continue
+
+        print(f"\nGallery size {gallerySize}:")
+        print(f"  Top-1 accuracy: {top1Correct/validTrials*100:.2f}%")
+        print(f"  Top-5 accuracy: {top5Correct/validTrials*100:.2f}%")
+        print(f"  Random baseline: {1/gallerySize*100:.2f}%")
+
+    print(f"\n{'='*50}")
+    return verifyAcc
+
 
 if __name__ == "__main__":
     #setup data only needs to be ran if the .pt files have not already been created
@@ -502,6 +610,8 @@ if __name__ == "__main__":
     #save weights to be loaded back in later
     torch.save(specModel.state_dict(), "specModel.pth")
     torch.save(faceModel.state_dict(), "faceModel.pth")
+
+    evaluate(specModel, faceModel, testLoader, device)
     pass
 
     #     break
