@@ -128,93 +128,6 @@ class ResNet18(nn.Module):
         out = self.fc(out)
         return out
         
-#Creates face-voice pairs for contrastive learning
-class FaceVoicePairDataset(Dataset):
-
-    def __init__(self, speakerList, numPairs=50000):
-        self.pairs = []
-        self.speakerData = {}
-        
-        # Load all speaker data
-        for spk in speakerList:
-            spkStr = str(spk)
-            
-            # Load video and spectrograms
-            videoTensor = torch.load(
-                Path('data') / Path("s" + spkStr + "video.pt")
-            )
-            specList = torch.load(
-                Path('data') / Path("s" + spkStr + "spectrograms.pt")
-            )
-            
-            self.speakerData[spk] = {
-                'video': videoTensor,
-                'specs': specList
-            }
-        
-        speakerListCopy = list(speakerList)
-        
-        # Create positive pairs (same person, different clips)
-        for _ in range(numPairs // 2):
-            spk = random.choice(speakerListCopy)
-            data = self.speakerData[spk]
-            numClips = len(data['video'])
-            if numClips < 2:
-                continue
-            
-            # Pick two different clips from the same person
-            i, j = random.sample(range(numClips), 2)
-            self.pairs.append({
-                'face_spk': spk,
-                'face_idx': i,      # face from clip i
-                'voice_spk': spk,
-                'voice_idx': j,     # voice from clip j
-                'label': 1          # same person
-            })
-        
-        # Create negative pairs (different people)
-        for _ in range(numPairs // 2):
-            spk1, spk2 = random.sample(speakerListCopy, 2)
-            data1 = self.speakerData[spk1]
-            data2 = self.speakerData[spk2]
-            
-            i = random.randint(0, len(data1['video']) - 1)
-            j = random.randint(0, len(data2['specs']) - 1)
-            
-            self.pairs.append({
-                'face_spk': spk1,
-                'face_idx': i,      # face from person 1
-                'voice_spk': spk2,
-                'voice_idx': j,     # voice from person 2
-                'label': 0          # different people
-            })
-        
-        random.shuffle(self.pairs)
-        print(f"Created {len(self.pairs)} pairs "
-              f"({numPairs // 2} positive, {numPairs // 2} negative)")
-    
-    def __len__(self):
-        return len(self.pairs)
-    
-    def __getitem__(self, idx):
-        pair = self.pairs[idx]
-        
-        # Get face: grab middle frame from the video, crop the face
-        video = self.speakerData[pair['face_spk']]['video'][pair['face_idx']]
-        middleFrame = video[len(video) // 2].numpy()
-        face = extractStillFace(middleFrame, targetSize=224)
-        # extractStillFace already returns (3, 224, 224) normalized tensor
-        
-        # Get voice spectrogram
-        spec = self.speakerData[pair['voice_spk']]['specs'][pair['voice_idx']]
-        # Add channel dimension: (128, time) -> (1, 128, time)
-        if spec.dim() == 2:
-            spec = spec.unsqueeze(0)
-        
-        label = pair['label']
-        
-        return face, spec, label
-    
 def makeSpectrogram(audioTensor, sr=25000, targetSr=16000):
     """Convert raw audio tensor to mel-spectrogram"""
     audio = audioTensor.numpy().squeeze()
@@ -591,14 +504,4 @@ if __name__ == "__main__":
     torch.save(faceModel.state_dict(), "faceModel.pth")
     pass
 
-    # #Testing the pair dataset on 3 speakers
-    # trainSpeakers = [1, 2, 3]
-    # dataset = FaceVoicePairDataset(trainSpeakers, numPairs=100)
-    
-    # loader = DataLoader(dataset, batch_size=16, shuffle=True)
-    
-    # for faces, specs, labels in loader:
-    #     print(f"Faces shape: {faces.shape}")
-    #     print(f"Specs shape: {specs.shape}")
-    #     print(f"Labels: {labels}")
     #     break
