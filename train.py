@@ -30,12 +30,13 @@ resizeResolution = 112
 
 #hyperparameters
 batchSize = 32
-specLearningRate = 0.1
+specLearningRate = 1e-3
 specMomentum = 0.9
 specWeightDecay = 5e-4
 specStepSize = 30
 specGamma = 0.1
-specEpochs = 10
+specEpochs = 5
+contrastiveTemperature = 0.07
 
 #define dataset classes
 class AVDataset(Dataset):
@@ -61,7 +62,7 @@ class ResBlock(nn.Module):
     def __init__(self, in_channels, out_channels, stride = 1):
         super(ResBlock, self).__init__()
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size = 3, stride = stride, padding = 1, bias = False)
-        self.bn1 = nn.batchNorm2d(out_channels)
+        self.bn1 = nn.BatchNorm2d(out_channels)
         self.relu = nn.ReLU(inplace = True)
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size = 3, stride = 1, padding = 1, bias = False)
         self.bn2 = nn.BatchNorm2d(out_channels)
@@ -91,8 +92,8 @@ class ResNet18(nn.Module):
         #in channels should equal the shape[0] of the spectrogram
         #128 in this case
         self.in_channels = 128
-        self.conv1 = nn.Conv2d(3, 128, kernel_size = 3, stride = 1, padding = 1, bias = False)
-        self.bn1 = nn.BatchNorm2d(64)
+        self.conv1 = nn.Conv2d(1, 128, kernel_size = 3, stride = 1, padding = 1, bias = False)
+        self.bn1 = nn.BatchNorm2d(128)
         self.relu = nn.ReLU(inplace = True)
         
         self.layer1 = self._make_layer(ResBlock, 128, 2, stride = 1)
@@ -296,6 +297,9 @@ def loadSpeaker(speakerNum):
 def collate_fn(batch):
     specs, videos, labels = zip(*batch)
     
+    #adjust spec size
+    specs = [spec.unsqueeze(0) for spec in specs]
+    
     #video padding
     #get the largest video
     mostFrames = max(v.shape[0] for v in videos)
@@ -317,27 +321,113 @@ def collate_fn(batch):
         torch.tensor(labels)
     )
 
-#training loop
-def train(model, device, trainLoader, testLoader, epochs):
-    size = len(trainLoader.dataset)
+#custom contrastive loss function because pytorch doesn't have one by default
+def contrastiveLoss(specEmbed, faceEmbed, temperature=contrastiveTemperature):
+    #normalize both
+    specEmbed = F.normalize(specEmbed, dim=1)
+    faceEmbed = F.normalize(faceEmbed, dim=1)
     
-    #train mode for batch norm
-    model.train()
+    #get the logits
+    logits = specEmbed @ faceEmbed.T
+    logits = logits / temperature
     
-    #for batch, (X, y) in enumerate(trainLoader):
-    #    X, y = X.to(device), y.to(device)
-    #    pred = model(X)
-    #    loss = lossFunc(pred, y)
-    #    
-    #    #backwards
-    #    loss.backward()
-    #    optimizer.step()
-    #    optimizer.zero_grad()
-    #    
-    #    if batch % 100 == 0:
-    #        #print loss at current step for debug purposes
-    #        loss, current = loss.item(), batch * batchSize + len(X)
-    #        print(f"loss: {loss:>7f}  [{current:>5d}/{size:>5d}]")
+    labels = torch.arange(specEmbed.size(0), device=specEmbed.device)
+    
+    #compare
+    lossS2F = F.cross_entropy(logits, labels)
+    lossF2S = F.cross_entropy(logits.T, labels)
+    
+    return (lossS2F + lossF2S) / 2
+    
+
+#training loop for training a spectrogram into 256 and a face into 256
+#this does not work with the videos yet, a seperate function will be made for that
+def train(specModel, faceModel, trainLoader, testLoader, optimizer, device):
+    #normalize so that the input matches what the pretrained resnet 50 actually wants
+    mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1,3,1,1)
+    std  = torch.tensor([0.229, 0.224, 0.225], device=device).view(1,3,1,1)
+    
+    #scaler for speedup
+    scaler = torch.amp.GradScaler()
+    
+    for epoch in range(specEpochs):
+        #set both models to train
+        specModel.train()
+        faceModel.train()
+        trainLoss = 0.0
+        batches = 0
+        
+        #training set
+        for specs, videos, labels in trainLoader:
+            specs = specs.to(device)
+            videos = videos.to(device)
+            
+            #forward prop
+            #first frame of each batch to get a face still
+            faces = videos[:, 0].to(device)
+            faces = faces.permute(0, 3, 1, 2)
+            faces = F.interpolate(faces, size=(224, 224))
+
+            faces = (faces - mean) / std
+            
+            optimizer.zero_grad()
+            
+            #wrap in a scaler
+            with torch.amp.autocast(device_type="cuda"):
+                specEmbed = specModel(specs)
+                faceEmbed = faceModel(faces)
+            
+                #calculate loss
+                loss = contrastiveLoss(specEmbed, faceEmbed)
+            
+            trainLoss += loss.item()
+            batches += 1
+            
+            if batches % 10 == 0:
+                print(f"Epoch {epoch} | Batch {batches} | Loss: {loss.item()}")
+            
+            #backward prop
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        
+        trainLoss /= batches
+        
+        scheduler.step()
+        
+        #test set
+        specModel.eval()
+        faceModel.eval()
+        testLoss = 0.0
+        batches = 0
+        
+        with torch.inference_mode():
+            for specs, videos, labels in testLoader:
+                specs = specs.to(device)
+                videos = videos.to(device)
+                
+                #forward prop
+                specEmbed = specModel(specs)
+                
+                faceEmbeds = []
+                #first frame of each batch to get a face still
+                faces = videos[:, 0].to(device)
+                faces = faces.permute(0, 3, 1, 2)
+                faces = F.interpolate(faces, size=(224, 224))
+
+                faces = (faces - mean) / std
+
+                faceEmbed = faceModel(faces)
+                
+                #calculate loss
+                loss = contrastiveLoss(specEmbed, faceEmbed)
+                testLoss += loss.item()
+                batches += 1
+        
+        #print the average loss over training and test set to get an idea of progress
+        testLoss /= batches
+        print(f"Epoch {epoch} | Train Loss: {trainLoss} | Test Loss: {testLoss}")
+            
 
 if __name__ == "__main__":
     #setup data only needs to be ran if the .pt files have not already been created
@@ -352,8 +442,8 @@ if __name__ == "__main__":
     
     trainData, testData = random_split(data, [trainSplit, testSplit])
     
-    trainLoader = DataLoader(trainData, batch_size=batchSize, shuffle=True, num_workers=2, collate_fn=collate_fn, pin_memory=True)
-    testLoader = DataLoader(testData, batch_size=batchSize, shuffle=False, num_workers=2, collate_fn=collate_fn, pin_memory=True)
+    trainLoader = DataLoader(trainData, batch_size=batchSize, shuffle=True, num_workers=8, persistent_workers=True, prefetch_factor=4, collate_fn=collate_fn, pin_memory=True)
+    testLoader = DataLoader(testData, batch_size=batchSize, shuffle=False, num_workers=8, persistent_workers=True, prefetch_factor=4, collate_fn=collate_fn, pin_memory=True)
     
     
     spec, vid, label = trainData[0]
@@ -366,9 +456,32 @@ if __name__ == "__main__":
     #define the spectrogram model
     specModel = ResNet18().to(device)
     
-    #Setup criterion for the ResNet18
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.SGD(specModel.parameters(), lr = specLearningRate, momentum = specMomentum, weight_decay = specWeightDecay)
-    scheduler = optim.lr_scheduler(optimizer, step_size = specStepSize, gamma = specGamma)
+    #define the face model
+    weights = models.ResNet50_Weights.DEFAULT
+    faceModel = models.resnet50(weights=weights)
+    #get a preprocess to give the resnet50 the shape it wants
+    preprocess = weights.transforms()
+    #alter output layer to fit the 256 we want
+    faceModel.fc = nn.Linear(faceModel.fc.in_features, 256)
     
+    #freeze part of the face model since its pretrained
+    for param in faceModel.parameters():
+        param.requires_grad = False
+    for param in faceModel.fc.parameters():
+        param.requires_grad = True
+    
+    faceModel = faceModel.to(device)
+    
+    #Setup criterion
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.SGD(list(specModel.parameters()) + list(faceModel.parameters()), lr = specLearningRate, momentum = specMomentum, weight_decay = specWeightDecay)
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size = specStepSize, gamma = specGamma)
+    
+    
+    
+    train(specModel, faceModel, trainLoader, testLoader, optimizer, device)
+    
+    #save weights to be loaded back in later
+    torch.save(specModel.state_dict(), "specModel.pth")
+    torch.save(faceModel.state_dict(), "faceModel.pth")
     pass
