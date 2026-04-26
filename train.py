@@ -28,14 +28,14 @@ sampleRate = 5
 resizeResolution = 112
 
 #hyperparameters
-batchSize = 32
+batchSize = 128
 specLearningRate = 1e-3
 specMomentum = 0.9
 specWeightDecay = 5e-4
 specStepSize = 30
 specGamma = 0.1
-specEpochs = 5
-contrastiveTemperature = 0.07
+specEpochs = 15
+contrastiveTemperature = 0.1
 
 #define dataset classes
 class AVDataset(Dataset):
@@ -342,8 +342,8 @@ def collate_fn(batch):
 #custom contrastive loss function because pytorch doesn't have one by default
 def contrastiveLoss(specEmbed, faceEmbed, temperature=contrastiveTemperature):
     #normalize both
-    specEmbed = F.normalize(specEmbed, dim=1)
-    faceEmbed = F.normalize(faceEmbed, dim=1)
+    specEmbed = F.normalize(specEmbed, dim=1, eps=1e-8)
+    faceEmbed = F.normalize(faceEmbed, dim=1, eps=1e-8)
     
     #get the logits
     logits = specEmbed @ faceEmbed.T
@@ -467,8 +467,8 @@ def evaluate(specModel, faceModel, testLoader, device):
             faces = F.interpolate(faces, size=(224, 224))
             faces = (faces - mean) / std
 
-            specEmbed = F.normalize(specModel(specs), dim=1)
-            faceEmbed = F.normalize(faceModel(faces), dim=1)
+            specEmbed = F.normalize(specModel(specs), dim=1, eps=1e-8)
+            faceEmbed = F.normalize(faceModel(faces), dim=1, eps=1e-8)
 
             allSpecEmbeds.append(specEmbed.cpu())
             allFaceEmbeds.append(faceEmbed.cpu())
@@ -568,8 +568,8 @@ if __name__ == "__main__":
     
     trainData, testData = random_split(data, [trainSplit, testSplit])
     
-    trainLoader = DataLoader(trainData, batch_size=batchSize, shuffle=True, num_workers=8, persistent_workers=True, prefetch_factor=4, collate_fn=collate_fn, pin_memory=True)
-    testLoader = DataLoader(testData, batch_size=batchSize, shuffle=False, num_workers=8, persistent_workers=True, prefetch_factor=4, collate_fn=collate_fn, pin_memory=True)
+    trainLoader = DataLoader(trainData, batch_size=batchSize, shuffle=True, num_workers=min(4, os.cpu_count()), persistent_workers=True, prefetch_factor=2, collate_fn=collate_fn, pin_memory=True)
+    testLoader = DataLoader(testData, batch_size=batchSize, shuffle=False, num_workers=min(4, os.cpu_count()), persistent_workers=True, prefetch_factor=2, collate_fn=collate_fn, pin_memory=True)
     
     
     spec, vid, label = trainData[0]
@@ -578,6 +578,7 @@ if __name__ == "__main__":
     
     #setup model
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    torch.backends.cudnn.benchmark = True
     
     #define the spectrogram model
     specModel = ResNet18().to(device)
@@ -604,13 +605,28 @@ if __name__ == "__main__":
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size = specStepSize, gamma = specGamma)
     
     
-    
-    train(specModel, faceModel, trainLoader, testLoader, optimizer, device)
-    
-    #save weights to be loaded back in later
-    torch.save(specModel.state_dict(), "specModel.pth")
-    torch.save(faceModel.state_dict(), "faceModel.pth")
+    #change below to change mode
+    # 0 -- DONT train and instead load weights, assumes there is a folder trainedWeights/ with two .pth in it
+    # 1 -- DO train and save weights
+    doTrain = 1
+    if doTrain:
+        train(specModel, faceModel, trainLoader, testLoader, optimizer, device)
+        
+        #save weights to be loaded back in later
+        torch.save(specModel.state_dict(), "specModel.pth")
+        torch.save(faceModel.state_dict(), "faceModel.pth")
+    else:
+        specWeights = torch.load("trainedWeights/specModel.pth", map_location=device)
+        faceWeights = torch.load("trainedWeights/faceModel.pth", map_location=device)
 
+        specModel.load_state_dict(specWeights)
+        faceModel.load_state_dict(faceWeights)
+
+        specModel.to(device)
+        faceModel.to(device)
+
+    
+    #run evaluation
     evaluate(specModel, faceModel, testLoader, device)
     pass
 
