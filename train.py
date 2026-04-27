@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import TensorDataset, DataLoader, Dataset, random_split
 from torchvision import datasets, models
+from sklearn.metrics import roc_curve
 from torchvision.transforms import ToTensor
 import torchvision.transforms as transforms
 from torch.optim import lr_scheduler
@@ -448,7 +449,6 @@ def train(specModel, faceModel, trainLoader, testLoader, optimizer, device):
 
 #Evaluate the trained model - verification and retrieval accuracy          
 def evaluate(specModel, faceModel, testLoader, device):
- 
     mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
     std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
 
@@ -480,20 +480,19 @@ def evaluate(specModel, faceModel, testLoader, device):
 
     total = len(allLabels)
     uniqueSpeakers = allLabels.unique()
+
     print(f"\n{'='*50}")
     print("EVALUATION RESULTS")
     print(f"{'='*50}")
     print(f"Total test samples: {total}")
     print(f"Unique speakers: {len(uniqueSpeakers)}")
 
+    #Raw verification accuracy
+    #not particularly helpful as its looking for exact matches
     similarity = allFaceEmbeds @ allSpecEmbeds.T
     predictions = similarity.argmax(dim=1)
 
-    correct = 0
-    for i in range(total):
-        if allLabels[i] == allLabels[predictions[i]]:
-            correct += 1
-
+    correct = (allLabels == allLabels[predictions]).sum().item()
     verifyAcc = correct / total * 100
     randomBaseline = 1 / len(uniqueSpeakers) * 100
 
@@ -501,7 +500,30 @@ def evaluate(specModel, faceModel, testLoader, device):
     print(f"Accuracy: {verifyAcc:.2f}%")
     print(f"Random guess baseline: {randomBaseline:.2f}%")
 
+    #EER (Equal error rate)
+    #Compares the number of false positives and false negatives
+    labels_matrix = (allLabels.unsqueeze(1) == allLabels.unsqueeze(0)).float()
+
+    #remove identical pairs (i == j)
+    mask = ~torch.eye(total, dtype=bool)
+    scores = similarity[mask]
+    targets = labels_matrix[mask]
+
+    scores_np = scores.numpy()
+    targets_np = targets.numpy()
+
+    fpr, tpr, thresholds = roc_curve(targets_np, scores_np)
+    fnr = 1 - tpr
+
+    eer_idx = np.nanargmin(np.abs(fpr - fnr))
+    eer = fpr[eer_idx] * 100
+
+    print("\n--- Verification (EER) ---")
+    print(f"EER: {eer:.2f}%")
+
+    #Retrieval accuracy
     print("\n--- Face-to-Voice Retrieval ---")
+
     for gallerySize in [10, 50, 100]:
         if gallerySize > total:
             continue
@@ -516,21 +538,25 @@ def evaluate(specModel, faceModel, testLoader, device):
             queryFace = allFaceEmbeds[queryIdx]
             queryLabel = allLabels[queryIdx]
 
-            matchingIdxs = (allLabels == queryLabel).nonzero().squeeze()
-            if matchingIdxs.dim() == 0:
+            matchingIdxs = ((allLabels == queryLabel) & (torch.arange(total) != queryIdx)).nonzero().squeeze()
+
+            if matchingIdxs.numel() == 0:
                 continue
 
             matchIdx = matchingIdxs[torch.randint(0, len(matchingIdxs), (1,))].item()
 
             nonMatchIdxs = (allLabels != queryLabel).nonzero().squeeze()
+
             if len(nonMatchIdxs) < gallerySize - 1:
                 continue
 
             randIdxs = nonMatchIdxs[torch.randperm(len(nonMatchIdxs))[:gallerySize - 1]]
+
             galleryIdxs = torch.cat([torch.tensor([matchIdx]), randIdxs])
 
             gallerySpecs = allSpecEmbeds[galleryIdxs]
             galleryLabels = allLabels[galleryIdxs]
+
             sims = F.cosine_similarity(queryFace.unsqueeze(0), gallerySpecs)
             ranked = sims.argsort(descending=True)
 
@@ -608,7 +634,7 @@ if __name__ == "__main__":
     #change below to change mode
     # 0 -- DONT train and instead load weights, assumes there is a folder trainedWeights/ with two .pth in it
     # 1 -- DO train and save weights
-    doTrain = 1
+    doTrain = 0
     if doTrain:
         train(specModel, faceModel, trainLoader, testLoader, optimizer, device)
         
