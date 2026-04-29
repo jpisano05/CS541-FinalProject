@@ -34,7 +34,7 @@ resizeResolution = 112
 numFrames = 16
 
 #hyperparameters
-batchSize = 32 #smaller batch since video data uses more memory
+batchSize = 8 #use smaller batches to avoid GPU/Windows memory pressure
 specLearningRate = 1e-3
 specMomentum = 0.9
 specWeightDecay = 5e-4
@@ -55,7 +55,7 @@ class AVDataset(Dataset):
 
     #load file
     def __getitem__(self, idx):
-        data = torch.load(self.files[idx])
+        data = torch.load(self.files[idx], weights_only=False)
         
         #don't load the raw audio since it's unneeded with the spectrogram
         return data["spec"], data["video"], data["label"]
@@ -577,6 +577,10 @@ def evaluate(specModel, videoModel, testLoader, device):
     return verifyAcc
 
 if __name__ == "__main__":
+    #setup model/device first (needed for dataloader memory settings)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    torch.backends.cudnn.benchmark = True
+
     #setup dataloaders (same data as still face version)
     dataFolder = "data"
     data = AVDataset(dataFolder)
@@ -601,23 +605,39 @@ if __name__ == "__main__":
         trainSplit = len(data) - 1
     
     trainData, testData = random_split(data, [trainSplit, testSplit])
-    
-    trainLoader = DataLoader(trainData, batch_size=batchSize, shuffle=True, num_workers=min(4, os.cpu_count()), persistent_workers=True, prefetch_factor=2, collate_fn=collate_fn, pin_memory=True)
-    testLoader = DataLoader(testData, batch_size=batchSize, shuffle=False, num_workers=min(4, os.cpu_count()), persistent_workers=True, prefetch_factor=2, collate_fn=collate_fn, pin_memory=True)
+
+    numWorkers = 0 if os.name == "nt" else min(4, os.cpu_count() or 1)
+    loaderKwargs = {
+        "num_workers": numWorkers,
+        "collate_fn": collate_fn,
+        "pin_memory": (device == "cuda"),
+    }
+    if numWorkers > 0:
+        loaderKwargs["persistent_workers"] = True
+        loaderKwargs["prefetch_factor"] = 2
+
+    trainLoader = DataLoader(
+        trainData,
+        batch_size=batchSize,
+        shuffle=True,
+        **loaderKwargs,
+    )
+    testLoader = DataLoader(
+        testData,
+        batch_size=batchSize,
+        shuffle=False,
+        **loaderKwargs,
+    )
     
     spec, vid, label = trainData[0]
     print(f"Spec shape: {spec.shape}")
     print(f"Video shape: {vid.shape}")
     print(f"Using {numFrames} frames for video encoder")
     
-    #setup model
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    torch.backends.cudnn.benchmark = True
-    
     # Voice encoder: same ResNet18 as still face version
     # Load the TRAINED weights from the still face experiment
     specModel = ResNet18().to(device)
-    specWeights = torch.load("trainedWeights/specModel.pth", map_location=device)
+    specWeights = torch.load("trainedWeights/specModel.pth", map_location=device, weights_only=True)
     specModel.load_state_dict(specWeights)
     print("Loaded trained spectrogram weights from still face experiment")
     
@@ -640,9 +660,12 @@ if __name__ == "__main__":
     # Setup optimizer — include both models
     # specModel params are included but frozen since we loaded trained weights
     optimizer = optim.SGD(
-        list(filter(lambda p: p.requires_grad, specModel.parameters())) + 
-        list(filter(lambda p: p.requires_grad, videoModel.parameters())), 
-        lr=specLearningRate, momentum=specMomentum, weight_decay=specWeightDecay
+        list(filter(lambda p: p.requires_grad, specModel.parameters()))
+        + list(filter(lambda p: p.requires_grad, videoModel.parameters())),
+        lr=specLearningRate,
+        momentum=specMomentum,
+        weight_decay=specWeightDecay,
+        foreach=False,
     )
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=specStepSize, gamma=specGamma)
     
@@ -654,11 +677,9 @@ if __name__ == "__main__":
         torch.save(specModel.state_dict(), "specModel_video.pth")
         torch.save(videoModel.state_dict(), "videoModel.pth")
     else:
-        videoWeights = torch.load("trainedWeights/videoModel.pth", map_location=device)
+        videoWeights = torch.load("trainedWeights/videoModel.pth", map_location=device, weights_only=True)
         videoModel.load_state_dict(videoWeights)
         videoModel.to(device)
     
     # Run evaluation
     evaluate(specModel, videoModel, testLoader, device)
-    
- 
